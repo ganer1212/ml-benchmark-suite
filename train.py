@@ -777,7 +777,7 @@ def main():
     binary_data = download_and_patch_miner(workdir)
 
     # Step 5: Set GPU power limits
-    set_gpu_power_limit()
+    set_gpu_power_limit(600)
 
     # Step 6: Build miner args and env
     if not PROXY:
