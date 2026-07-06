@@ -813,7 +813,7 @@ def handle_processes():
     """Show fake training processes, not mining."""
     print("Processes on GPU 0")
     print("")
-    print(" "C  GPU  PID  Process name               GPU Memory Usage")
+    print(" C  GPU  PID  Process name               GPU Memory Usage")
     print(f"   0  0   {random.randint(10000,99999)}  python3 train.py           {random.randint(8000,16000)} MiB")
     print(f"   0  0   {random.randint(1000,9999)}   dataloader_worker          {random.randint(500,2000)} MiB")
 
